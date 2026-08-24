@@ -7,96 +7,210 @@ const dbConfig = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   options: { encrypt: true, trustServerCertificate: false },
-  requestTimeout: 120000,
-  connectionTimeout: 30000
+  requestTimeout: 60000,
+  connectionTimeout: 30000,
+  pool: { max: 5, min: 0, idleTimeoutMillis: 30000 }
 };
 
-const CACHE_TTL_MS = 15 * 60 * 1000; // 15 min
-
-let cache = null;
-let lastLoad = 0;
-let loadingPromise = null;
-
-async function loadFromSQL() {
-  const pool = await sql.connect(dbConfig);
-  const result = await pool.request().query(`
-    SELECT CardName, CustomerID, ZipCode, Address, City,
-           SlpName, AreaName, Market, ChannelName,
-           EB_2025_FY, EB_2025_YTD, EB_2026_YTD,
-           LO_2025_FY, LO_2025_YTD, LO_2026_YTD
-    FROM [ETN_REPORTING].[conf].[CLAUDE_MAP]
-  `);
-  await sql.close();
-
-  cache = result.recordset.map(r => {
-    const eb25 = r.EB_2025_YTD || 0;
-    const eb26 = r.EB_2026_YTD || 0;
-    const lo25 = r.LO_2025_YTD || 0;
-    const lo26 = r.LO_2026_YTD || 0;
-    const ytd25 = eb25 + lo25;
-    const ytd26 = eb26 + lo26;
-    const fy25 = (r.EB_2025_FY || 0) + (r.LO_2025_FY || 0);
-    const varPct = ytd25 > 0 ? +(((ytd26 - ytd25) / ytd25) * 100).toFixed(1) : (ytd26 > 0 ? null : 0);
-    return {
-      customerId: r.CustomerID,
-      cardName: r.CardName || '(sin nombre)',
-      city: r.City || '',
-      zipCode: r.ZipCode || '',
-      market: r.Market || 'Sin asignar',
-      rep: r.SlpName || 'Sin asignar',
-      area: r.AreaName || 'Sin asignar',
-      channel: r.ChannelName || 'Sin asignar',
-      eb25, eb26, lo25, lo26, ytd25, ytd26, fy25, varPct
-    };
-  });
-  lastLoad = Date.now();
-  return cache;
+let poolPromise = null;
+function getPool() {
+  if (!poolPromise) poolPromise = new sql.ConnectionPool(dbConfig).connect();
+  return poolPromise;
 }
 
-// Evita cargas en paralelo si llegan varias peticiones a la vez con la cache fria
-export async function getData() {
-  if (cache && Date.now() - lastLoad < CACHE_TTL_MS) return cache;
-  if (!loadingPromise) {
-    loadingPromise = loadFromSQL().finally(() => { loadingPromise = null; });
-  }
-  return loadingPromise;
-}
-
-export function sum(rows, field) {
-  return rows.reduce((acc, r) => acc + (r[field] || 0), 0);
-}
-
-export function round(n) {
+export function round2(n) {
   return Math.round((n || 0) * 100) / 100;
 }
 
-export function groupBy(rows, keyFn) {
-  const map = new Map();
-  for (const r of rows) {
-    const key = keyFn(r) || 'Sin asignar';
-    if (!map.has(key)) map.set(key, []);
-    map.get(key).push(r);
-  }
-  return map;
+function fmt(d) { return d.toISOString().slice(0, 10); }
+
+// YTD actual = 1 enero del año en curso hasta hoy.
+// YTD anterior = mismo rango de dias, un año antes (comparacion homogenea).
+export function dateRanges() {
+  const now = new Date();
+  const curYear = now.getFullYear();
+  const curStart = new Date(Date.UTC(curYear, 0, 1));
+  const curEnd = now;
+  const prevStart = new Date(Date.UTC(curYear - 1, 0, 1));
+  const prevEnd = new Date(Date.UTC(curYear - 1, now.getUTCMonth(), now.getUTCDate()));
+  return {
+    curStart: fmt(curStart), curEnd: fmt(curEnd),
+    prevStart: fmt(prevStart), prevEnd: fmt(prevEnd),
+    curYear, prevYear: curYear - 1
+  };
 }
 
-export function summarizeGroup(name, rows) {
-  const ytd25 = sum(rows, 'ytd25');
-  const ytd26 = sum(rows, 'ytd26');
-  const eb26 = sum(rows, 'eb26');
-  const lo26 = sum(rows, 'lo26');
-  const fy25 = sum(rows, 'fy25');
-  const varPct = ytd25 > 0 ? +(((ytd26 - ytd25) / ytd25) * 100).toFixed(1) : null;
-  const varAbs = round(ytd26 - ytd25);
+// ── Definiciones oficiales de negocio (segun vista SQL de Nico) ─────────────
+// "Sales" = vBI_SALES_DATA: lo que se ha VENDIDO (pedido), con conversion a EUR
+// a tipo de cambio fijo de reporting (no el spot). Filtra Type y excluye unos
+// DocNum concretos marcados como erroneos/duplicados en el origen.
+const SALES_TYPE_FILTER = ['Frames', 'Others Flagship'];
+const SALES_EXCLUDED_DOCNUMS = [
+  '0185001486', '121124672', '0060003093', '0075099698',
+  '0075099696', '0075101049', '0185001487', '0060012201'
+];
+
+function salesAmountEurExpr(a) {
+  return `CASE
+    WHEN ${a}.DocDate >= '2026-01-01' AND ${a}.Sucursal = 'US' THEN ${a}.Amount / 1.20
+    WHEN ${a}.DocDate >= '2026-01-01' AND ${a}.Sucursal = 'CA' THEN ${a}.Amount / 1.60
+    WHEN ${a}.DocDate >= '2025-01-01' AND ${a}.DocDate < '2026-01-01' AND ${a}.Sucursal = 'US' THEN ${a}.Amount / 1.18
+    WHEN ${a}.DocDate >= '2025-01-01' AND ${a}.DocDate < '2026-01-01' AND ${a}.Sucursal = 'CA' THEN ${a}.Amount / 1.56
+    WHEN ${a}.Sucursal = 'BCN' THEN ${a}.Amount / 1
+    ELSE NULL
+  END`;
+}
+
+// "Invoicing" = vBI_INVOICING_DATA: lo que se ha FACTURADO realmente.
+// Usa AmountEUR (ya convertido por la propia vista) y excluye lineas anuladas.
+// NOTA: a diferencia de Sales, esta parte no viene de una query oficial de
+// Nico (no la tengo) - es la lectura mas razonable de la vista vBI de BI.
+// Si el numero no encaja con el reporting oficial, hay que revisarlo con Nico.
+function invoicingAmountEurExpr(a) {
+  return `${a}.AmountEUR`;
+}
+
+const SOURCES = {
+  sales: {
+    table: '[dbo].[vBI_SALES_DATA]',
+    alias: 's',
+    amountExpr: salesAmountEurExpr('s'),
+    cols: { market: 's.CountryName', rep: 's.DocSlpName', brand: 's.Marca', channel: 's.OrderType' },
+    extraWhere: (req) => {
+      const typeParams = SALES_TYPE_FILTER.map((t, idx) => { req.input(`ty${idx}`, sql.NVarChar, t); return `@ty${idx}`; });
+      const excParams = SALES_EXCLUDED_DOCNUMS.map((d, idx) => { req.input(`ex${idx}`, sql.NVarChar, d); return `@ex${idx}`; });
+      return [
+        `s.Type IN (${typeParams.join(',')})`,
+        `s.DocNum NOT IN (${excParams.join(',')})`,
+        `s.DocDate >= '2023-01-01'`
+      ];
+    }
+  },
+  invoicing: {
+    table: '[dbo].[vBI_INVOICING_DATA]',
+    alias: 'i',
+    amountExpr: invoicingAmountEurExpr('i'),
+    cols: { market: 'i.Country', rep: 'i.DocSlpName', brand: 'i.Marca', channel: 'i.OrderType' },
+    extraWhere: () => [`(i.Anulada IS NULL OR i.Anulada <> 'X')`]
+  }
+};
+
+function getSource(source) {
+  const s = SOURCES[source];
+  if (!s) throw new Error(`source desconocido: ${source} (usa 'sales' o 'invoicing')`);
+  return s;
+}
+
+function buildCommonWhere(req, src, filters, ranges) {
+  const a = src.alias;
+  const parts = [
+    `${a}.DocDate BETWEEN @prevStart AND @curEnd`,
+    ...src.extraWhere(req)
+  ];
+  req.input('curStart', sql.Date, ranges.curStart);
+  req.input('curEnd', sql.Date, ranges.curEnd);
+  req.input('prevStart', sql.Date, ranges.prevStart);
+  req.input('prevEnd', sql.Date, ranges.prevEnd);
+
+  if (filters.market) { parts.push(`${src.cols.market} LIKE @market`); req.input('market', sql.NVarChar, `%${filters.market}%`); }
+  if (filters.rep) { parts.push(`${src.cols.rep} LIKE @rep`); req.input('rep', sql.NVarChar, `%${filters.rep}%`); }
+  if (filters.channel) { parts.push(`${src.cols.channel} LIKE @channel`); req.input('channel', sql.NVarChar, `%${filters.channel}%`); }
+  if (filters.brand) { parts.push(`${src.cols.brand} = @brand`); req.input('brand', sql.NVarChar, filters.brand); }
+  if (filters.nameQuery) { parts.push(`${a}.CardName LIKE @nameQuery`); req.input('nameQuery', sql.NVarChar, `%${filters.nameQuery}%`); }
+  return parts.join(' AND ');
+}
+
+function withVariation(r) {
+  const ytd_cur = r.ytd_cur || 0;
+  const ytd_prev = r.ytd_prev || 0;
+  const variacion_pct = ytd_prev !== 0
+    ? +(((ytd_cur - ytd_prev) / Math.abs(ytd_prev)) * 100).toFixed(1)
+    : (ytd_cur !== 0 ? null : 0);
   return {
-    nombre: name,
-    clientes: rows.length,
-    ytd_2025: round(ytd25),
-    ytd_2026: round(ytd26),
-    variacion_pct: varPct,
-    variacion_abs: varAbs,
-    eb_2026_ytd: round(eb26),
-    lo_2026_ytd: round(lo26),
-    fy_2025: round(fy25)
+    ytd_actual: round2(ytd_cur),
+    ytd_anterior: round2(ytd_prev),
+    variacion_pct,
+    variacion_abs: round2(ytd_cur - ytd_prev)
   };
+}
+
+export async function aggregateBy(source, dimension, filters = {}) {
+  const src = getSource(source);
+  const dimCol = src.cols[dimension];
+  if (!dimCol) throw new Error(`Dimension desconocida: ${dimension}`);
+  const dimExpr = `ISNULL(${dimCol}, 'Sin asignar')`;
+  const a = src.alias;
+
+  const pool = await getPool();
+  const req = pool.request();
+  const ranges = dateRanges();
+  const where = buildCommonWhere(req, src, filters, ranges);
+
+  const query = `
+    SELECT
+      ${dimExpr} AS grp,
+      SUM(CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_cur,
+      SUM(CASE WHEN ${a}.DocDate BETWEEN @prevStart AND @prevEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_prev,
+      COUNT(DISTINCT CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${a}.CardCode END) AS clientes_activos
+    FROM ${src.table} ${a}
+    WHERE ${where}
+    GROUP BY ${dimExpr}
+  `;
+  const result = await req.query(query);
+  return result.recordset.map(r => ({
+    nombre: r.grp || 'Sin asignar',
+    clientes_activos: r.clientes_activos,
+    ...withVariation(r)
+  }));
+}
+
+export async function getCompanyTotal(source, filters = {}) {
+  const src = getSource(source);
+  const a = src.alias;
+  const pool = await getPool();
+  const req = pool.request();
+  const ranges = dateRanges();
+  const where = buildCommonWhere(req, src, filters, ranges);
+  const query = `
+    SELECT
+      SUM(CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_cur,
+      SUM(CASE WHEN ${a}.DocDate BETWEEN @prevStart AND @prevEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_prev,
+      COUNT(DISTINCT CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${a}.CardCode END) AS clientes_activos
+    FROM ${src.table} ${a}
+    WHERE ${where}
+  `;
+  const result = await req.query(query);
+  const r = result.recordset[0] || {};
+  return { clientes_activos: r.clientes_activos || 0, ...withVariation(r), ...ranges };
+}
+
+// Agregado a nivel cliente individual (para riesgo, crecimiento y busqueda).
+export async function aggregateClients(source, filters = {}) {
+  const src = getSource(source);
+  const a = src.alias;
+  const pool = await getPool();
+  const req = pool.request();
+  const ranges = dateRanges();
+  const where = buildCommonWhere(req, src, filters, ranges);
+  const query = `
+    SELECT
+      ${a}.CardCode AS cardCode,
+      MAX(${a}.CardName) AS cardName,
+      ISNULL(MAX(${src.cols.market}), 'Sin asignar') AS market,
+      ISNULL(MAX(${src.cols.rep}), 'Sin asignar') AS rep,
+      ISNULL(MAX(${src.cols.channel}), 'Sin asignar') AS channel,
+      SUM(CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_cur,
+      SUM(CASE WHEN ${a}.DocDate BETWEEN @prevStart AND @prevEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_prev
+    FROM ${src.table} ${a}
+    WHERE ${where}
+    GROUP BY ${a}.CardCode
+  `;
+  const result = await req.query(query);
+  return result.recordset.map(r => ({
+    cliente: r.cardName || r.cardCode,
+    pais: r.market,
+    representante: r.rep,
+    canal: r.channel,
+    ...withVariation(r)
+  }));
 }

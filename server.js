@@ -1,20 +1,24 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
-import { getData, sum, round, groupBy, summarizeGroup } from './data.js';
+import { aggregateBy, getCompanyTotal, aggregateClients, round2 } from './data.js';
 
 const PERSONA = `Eres el analista de ventas senior de ETNIA (marca de moda de gafas). Cuando uses estas
 herramientas para responder, actua como un experto en analitica comercial retail/eyewear:
+- Hay dos fuentes de datos distintas, elegibles con el parametro "source":
+  - "sales": lo que se ha VENDIDO/pedido (vista vBI_SALES_DATA), en EUR a tipo de cambio fijo de reporting.
+  - "invoicing": lo que se ha FACTURADO realmente (vista vBI_INVOICING_DATA), en EUR.
+  Si el usuario no especifica cual quiere, usa "sales" por defecto pero acláralo, y ofrece comparar
+  ambas si la pregunta es ambigua (p.ej. "vendido" vs "facturado" pueden diferir por plazos de envio/cobro).
 - Da siempre el numero Y la lectura de negocio (que significa, si es bueno o malo, por que podria estar pasando).
 - Prioriza palancas de mejora concretas y accionables: concentracion de cartera en pocos clientes,
   representantes o zonas por debajo de la media, clientes con caida de YTD que conviene visitar,
-  diferencias de mix EB vs LO, estacionalidad.
-- Compara siempre contra el año anterior (YTD 2025 vs YTD 2026) y contra la media del grupo (pais, red, canal).
+  diferencias de mix por marca, estacionalidad.
+- Compara siempre contra el año anterior (mismo rango de dias YTD) y contra la media del grupo (pais, rep, canal).
 - Si detectas un dato con muy pocos clientes o volumen bajo, adviertelo (baja significatividad).
 - Se directo y conciso, con listas y numeros, no rodeos.`;
 
@@ -24,13 +28,17 @@ function textResult(obj) {
   return { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] };
 }
 
-function applyFilters(rows, { market, rep, channel } = {}) {
-  let r = rows;
-  if (market) r = r.filter(x => x.market.toLowerCase().includes(market.toLowerCase()));
-  if (rep) r = r.filter(x => x.rep.toLowerCase().includes(rep.toLowerCase()));
-  if (channel) r = r.filter(x => x.channel.toLowerCase().includes(channel.toLowerCase()));
-  return r;
-}
+const sourceSchema = {
+  source: z.enum(['sales', 'invoicing']).optional().describe('"sales" = lo vendido/pedido (vBI_SALES_DATA). "invoicing" = lo facturado (vBI_INVOICING_DATA). Por defecto "sales".')
+};
+
+const filterSchema = {
+  ...sourceSchema,
+  market: z.string().optional().describe('Filtra por pais/mercado (coincidencia parcial, insensible a mayusculas).'),
+  rep: z.string().optional().describe('Filtra por representante comercial (coincidencia parcial).'),
+  channel: z.string().optional().describe('Filtra por canal/tipo de pedido (OrderType: p.ej. IPAD, POS, EDI...).'),
+  brand: z.string().optional().describe('Filtra por codigo de marca exacto (p.ej. EB, LO, PE, CH, TR, AP).')
+};
 
 function createServer() {
   const server = new McpServer(
@@ -42,128 +50,100 @@ function createServer() {
     'company_overview',
     {
       title: 'Vision general de la compañia',
-      description: 'KPIs globales de ETNIA: ventas YTD 2025 vs 2026 (EB+LO), variacion %, numero de clientes activos, y ranking de los 5 paises y 5 representantes con mayor volumen. Punto de partida para cualquier pregunta general sobre "como va la compañia".',
-      inputSchema: {}
+      description: 'KPIs globales de ETNIA: YTD del año en curso vs mismo periodo del año anterior, variacion %, clientes activos, y ranking de paises/representantes/marcas. Usa "source" para elegir entre "sales" (vendido) e "invoicing" (facturado). Punto de partida para cualquier pregunta general sobre "como va la compañia".',
+      inputSchema: { ...sourceSchema }
     },
-    async () => {
-      const rows = await getData();
-      const total = summarizeGroup('ETNIA (total)', rows);
-
-      const byMarket = groupBy(rows, r => r.market);
-      const topMarkets = [...byMarket.entries()]
-        .map(([name, g]) => summarizeGroup(name, g))
-        .sort((a, b) => b.ytd_2026 - a.ytd_2026)
-        .slice(0, 5);
-
-      const byRep = groupBy(rows, r => r.rep);
-      const topReps = [...byRep.entries()]
-        .map(([name, g]) => summarizeGroup(name, g))
-        .sort((a, b) => b.ytd_2026 - a.ytd_2026)
-        .slice(0, 5);
-
+    async ({ source = 'sales' }) => {
+      const [total, byMarket, byRep, byBrand] = await Promise.all([
+        getCompanyTotal(source),
+        aggregateBy(source, 'market'),
+        aggregateBy(source, 'rep'),
+        aggregateBy(source, 'brand')
+      ]);
+      const top = (list, n = 5) => [...list].sort((a, b) => b.ytd_actual - a.ytd_actual).slice(0, n);
       return textResult({
-        resumen: total,
-        top_5_paises: topMarkets,
-        top_5_representantes: topReps,
-        num_paises: byMarket.size,
-        num_representantes: byRep.size
+        fuente: source,
+        periodo: { desde: total.curStart, hasta: total.curEnd, comparado_con: `${total.prevStart} a ${total.prevEnd}` },
+        resumen_total: {
+          ytd_actual: total.ytd_actual, ytd_anterior: total.ytd_anterior,
+          variacion_pct: total.variacion_pct, variacion_abs: total.variacion_abs,
+          clientes_activos: total.clientes_activos
+        },
+        top_5_paises: top(byMarket),
+        top_5_representantes: top(byRep),
+        ventas_por_marca: byBrand.sort((a, b) => b.ytd_actual - a.ytd_actual),
+        num_paises: byMarket.length,
+        num_representantes: byRep.length
       });
     }
   );
 
-  server.registerTool(
-    'sales_by_country',
-    {
-      title: 'Ventas por pais / mercado',
-      description: 'Desglosa las ventas (YTD 2025 vs 2026, variacion %, numero de clientes) por pais/mercado (columna Market). Usalo para responder "como van las ventas por pais" o para comparar paises entre si.',
+  function registerDimensionTool(name, dimension, title, description) {
+    server.registerTool(name, {
+      title,
+      description,
       inputSchema: {
-        top_n: z.number().int().min(1).max(100).optional().describe('Cuantos paises devolver, ordenados de mayor a menor venta YTD 2026. Por defecto 20.'),
-        sort_by: z.enum(['ytd_2026', 'variacion_pct', 'clientes']).optional().describe('Criterio de ordenacion. Por defecto ytd_2026.')
+        ...filterSchema,
+        top_n: z.number().int().min(1).max(100).optional().describe('Cuantos resultados devolver, ordenados de mayor a menor YTD actual. Por defecto 20.'),
+        sort_by: z.enum(['ytd_actual', 'variacion_pct', 'clientes_activos']).optional().describe('Criterio de ordenacion. Por defecto ytd_actual.')
       }
-    },
-    async ({ top_n = 20, sort_by = 'ytd_2026' }) => {
-      const rows = await getData();
-      const groups = groupBy(rows, r => r.market);
-      const list = [...groups.entries()].map(([name, g]) => summarizeGroup(name, g));
+    }, async ({ source = 'sales', market, rep, channel, brand, top_n = 20, sort_by = 'ytd_actual' }) => {
+      const list = await aggregateBy(source, dimension, { market, rep, channel, brand });
       list.sort((a, b) => (b[sort_by] ?? -Infinity) - (a[sort_by] ?? -Infinity));
-      return textResult({ paises: list.slice(0, top_n), total_paises: list.length });
-    }
-  );
+      return textResult({
+        fuente: source,
+        filtros: { market: market || null, rep: rep || null, channel: channel || null, brand: brand || null },
+        resultados: list.slice(0, top_n),
+        total_grupos: list.length
+      });
+    });
+  }
 
-  server.registerTool(
-    'sales_by_rep',
-    {
-      title: 'Ventas por representante comercial',
-      description: 'Desglosa las ventas (YTD 2025 vs 2026, variacion %, numero de clientes) por representante (columna SlpName), opcionalmente filtrado por pais. Usalo para responder "como van los comerciales", detectar quien crece/decrece, o comparar reps de un mismo pais.',
-      inputSchema: {
-        market: z.string().optional().describe('Filtra a un pais/mercado concreto (coincidencia parcial, insensible a mayusculas).'),
-        top_n: z.number().int().min(1).max(100).optional().describe('Cuantos representantes devolver. Por defecto 20.'),
-        sort_by: z.enum(['ytd_2026', 'variacion_pct', 'clientes']).optional().describe('Criterio de ordenacion. Por defecto ytd_2026.')
-      }
-    },
-    async ({ market, top_n = 20, sort_by = 'ytd_2026' }) => {
-      const rows = applyFilters(await getData(), { market });
-      const groups = groupBy(rows, r => r.rep);
-      const list = [...groups.entries()].map(([name, g]) => summarizeGroup(name, g));
-      list.sort((a, b) => (b[sort_by] ?? -Infinity) - (a[sort_by] ?? -Infinity));
-      return textResult({ filtro_pais: market || null, representantes: list.slice(0, top_n), total_representantes: list.length });
-    }
+  registerDimensionTool(
+    'sales_by_country', 'market',
+    'Ventas o facturación por pais / mercado',
+    'Desglosa por pais/mercado (actual vs año anterior, variacion %, clientes activos). Usa "source": "sales" para lo vendido/pedido, "invoicing" para lo facturado. Usalo para "como van las ventas por pais" o comparar paises.'
   );
-
-  server.registerTool(
-    'sales_by_channel',
-    {
-      title: 'Ventas por canal',
-      description: 'Desglosa las ventas (YTD 2025 vs 2026, variacion %, numero de clientes) por canal (columna ChannelName), opcionalmente filtrado por pais o representante.',
-      inputSchema: {
-        market: z.string().optional().describe('Filtra por pais/mercado (coincidencia parcial).'),
-        rep: z.string().optional().describe('Filtra por representante (coincidencia parcial).')
-      }
-    },
-    async ({ market, rep }) => {
-      const rows = applyFilters(await getData(), { market, rep });
-      const groups = groupBy(rows, r => r.channel);
-      const list = [...groups.entries()]
-        .map(([name, g]) => summarizeGroup(name, g))
-        .sort((a, b) => b.ytd_2026 - a.ytd_2026);
-      return textResult({ filtros: { market: market || null, rep: rep || null }, canales: list });
-    }
+  registerDimensionTool(
+    'sales_by_rep', 'rep',
+    'Ventas o facturación por representante comercial',
+    'Desglosa por representante comercial (cartera asignada). Usa "source" para elegir vendido/facturado. Usalo para ver quien crece/decrece o comparar reps de un mismo pais (filtro market).'
+  );
+  registerDimensionTool(
+    'sales_by_channel', 'channel',
+    'Ventas o facturación por canal',
+    'Desglosa por canal/tipo de pedido (OrderType). Usa "source" para elegir vendido/facturado.'
+  );
+  registerDimensionTool(
+    'sales_by_brand', 'brand',
+    'Ventas o facturación por marca',
+    'Desglosa por marca (codigo interno: EB, LO, PE, CH, TR, AP). Usa "source" para elegir vendido/facturado.'
   );
 
   server.registerTool(
     'client_risk_alerts',
     {
       title: 'Clientes en riesgo (caida de ventas)',
-      description: 'Lista clientes cuya venta YTD ha caido mas de un % respecto al año anterior, ordenados por importe perdido (mayor a menor). Pensado para generar una lista de visitas prioritarias / accion comercial. Ignora clientes con muy poco volumen para evitar ruido.',
+      description: 'Lista clientes cuyo YTD ha caido mas de un % respecto al año anterior, ordenados por importe perdido. Pensado para generar una lista de visitas prioritarias. Ignora clientes con poco volumen para evitar ruido. Usa "source" para elegir vendido/facturado.',
       inputSchema: {
+        ...filterSchema,
         min_drop_pct: z.number().min(0).max(100).optional().describe('Caida minima en % para considerarse en riesgo. Por defecto 15.'),
-        min_ytd_2025: z.number().min(0).optional().describe('Venta minima en YTD 2025 para que el cliente cuente (evita ruido de clientes muy pequeños). Por defecto 500.'),
-        market: z.string().optional().describe('Filtra por pais/mercado.'),
-        rep: z.string().optional().describe('Filtra por representante.'),
+        min_ytd_anterior: z.number().min(0).optional().describe('Venta minima el año anterior para que el cliente cuente (evita ruido de clientes muy pequeños). Por defecto 500.'),
         limit: z.number().int().min(1).max(200).optional().describe('Numero maximo de clientes a devolver. Por defecto 30.')
       }
     },
-    async ({ min_drop_pct = 15, min_ytd_2025 = 500, market, rep, limit = 30 }) => {
-      const rows = applyFilters(await getData(), { market, rep });
-      const risk = rows
-        .filter(r => r.ytd25 >= min_ytd_2025 && r.varPct !== null && r.varPct <= -min_drop_pct)
-        .map(r => ({
-          cliente: r.cardName,
-          ciudad: r.city,
-          pais: r.market,
-          representante: r.rep,
-          canal: r.channel,
-          ytd_2025: round(r.ytd25),
-          ytd_2026: round(r.ytd26),
-          variacion_pct: r.varPct,
-          importe_perdido: round(r.ytd25 - r.ytd26)
-        }))
+    async ({ source = 'sales', market, rep, channel, brand, min_drop_pct = 15, min_ytd_anterior = 500, limit = 30 }) => {
+      const clients = await aggregateClients(source, { market, rep, channel, brand });
+      const risk = clients
+        .filter(c => c.ytd_anterior >= min_ytd_anterior && c.variacion_pct !== null && c.variacion_pct <= -min_drop_pct)
+        .map(c => ({ ...c, importe_perdido: round2(c.ytd_anterior - c.ytd_actual) }))
         .sort((a, b) => b.importe_perdido - a.importe_perdido)
         .slice(0, limit);
       return textResult({
-        criterios: { min_drop_pct, min_ytd_2025, market: market || null, rep: rep || null },
+        fuente: source,
+        criterios: { min_drop_pct, min_ytd_anterior, market: market || null, rep: rep || null },
         clientes_en_riesgo: risk,
-        importe_total_en_riesgo: round(risk.reduce((a, r) => a + r.importe_perdido, 0))
+        importe_total_en_riesgo: round2(risk.reduce((a, c) => a + c.importe_perdido, 0))
       });
     }
   );
@@ -172,35 +152,25 @@ function createServer() {
     'growth_opportunities',
     {
       title: 'Clientes con mayor crecimiento',
-      description: 'Lista clientes cuya venta YTD ha crecido mas de un % respecto al año anterior, ordenados por importe ganado. Utilo para identificar cuentas en las que redoblar apuesta, o para entender que esta funcionando bien.',
+      description: 'Lista clientes cuyo YTD ha crecido mas de un % respecto al año anterior, ordenados por importe ganado. Util para identificar cuentas en las que redoblar apuesta. Usa "source" para elegir vendido/facturado.',
       inputSchema: {
+        ...filterSchema,
         min_growth_pct: z.number().min(0).optional().describe('Crecimiento minimo en % para incluir al cliente. Por defecto 15.'),
-        market: z.string().optional().describe('Filtra por pais/mercado.'),
-        rep: z.string().optional().describe('Filtra por representante.'),
         limit: z.number().int().min(1).max(200).optional().describe('Numero maximo de clientes a devolver. Por defecto 30.')
       }
     },
-    async ({ min_growth_pct = 15, market, rep, limit = 30 }) => {
-      const rows = applyFilters(await getData(), { market, rep });
-      const growth = rows
-        .filter(r => r.varPct !== null && r.varPct >= min_growth_pct)
-        .map(r => ({
-          cliente: r.cardName,
-          ciudad: r.city,
-          pais: r.market,
-          representante: r.rep,
-          canal: r.channel,
-          ytd_2025: round(r.ytd25),
-          ytd_2026: round(r.ytd26),
-          variacion_pct: r.varPct,
-          importe_ganado: round(r.ytd26 - r.ytd25)
-        }))
+    async ({ source = 'sales', market, rep, channel, brand, min_growth_pct = 15, limit = 30 }) => {
+      const clients = await aggregateClients(source, { market, rep, channel, brand });
+      const growth = clients
+        .filter(c => c.variacion_pct !== null && c.variacion_pct >= min_growth_pct)
+        .map(c => ({ ...c, importe_ganado: round2(c.ytd_actual - c.ytd_anterior) }))
         .sort((a, b) => b.importe_ganado - a.importe_ganado)
         .slice(0, limit);
       return textResult({
+        fuente: source,
         criterios: { min_growth_pct, market: market || null, rep: rep || null },
         clientes_en_crecimiento: growth,
-        importe_total_ganado: round(growth.reduce((a, r) => a + r.importe_ganado, 0))
+        importe_total_ganado: round2(growth.reduce((a, c) => a + c.importe_ganado, 0))
       });
     }
   );
@@ -209,30 +179,16 @@ function createServer() {
     'search_clients',
     {
       title: 'Buscar clientes concretos',
-      description: 'Busca clientes por nombre/ciudad y devuelve su detalle de ventas (YTD 2025 vs 2026, variacion, representante, pais, canal). Usalo cuando el usuario pregunte por una optica o cliente concreto por nombre.',
+      description: 'Busca clientes por nombre y devuelve su detalle YTD (actual vs año anterior, variacion, representante, pais, canal). Usa "source" para elegir vendido/facturado.',
       inputSchema: {
-        query: z.string().describe('Texto a buscar en el nombre del cliente o la ciudad (coincidencia parcial, insensible a mayusculas).'),
-        market: z.string().optional().describe('Filtra por pais/mercado.'),
-        rep: z.string().optional().describe('Filtra por representante.'),
+        query: z.string().describe('Texto a buscar en el nombre del cliente (coincidencia parcial, insensible a mayusculas).'),
+        ...filterSchema,
         limit: z.number().int().min(1).max(100).optional().describe('Numero maximo de resultados. Por defecto 20.')
       }
     },
-    async ({ query, market, rep, limit = 20 }) => {
-      const q = query.toLowerCase();
-      const rows = applyFilters(await getData(), { market, rep })
-        .filter(r => r.cardName.toLowerCase().includes(q) || r.city.toLowerCase().includes(q));
-      const list = rows.slice(0, limit).map(r => ({
-        cliente: r.cardName,
-        ciudad: r.city,
-        pais: r.market,
-        representante: r.rep,
-        canal: r.channel,
-        ytd_2025: round(r.ytd25),
-        ytd_2026: round(r.ytd26),
-        variacion_pct: r.varPct,
-        fy_2025: round(r.fy25)
-      }));
-      return textResult({ query, total_encontrados: rows.length, resultados: list });
+    async ({ query, source = 'sales', market, rep, channel, brand, limit = 20 }) => {
+      const clients = await aggregateClients(source, { market, rep, channel, brand, nameQuery: query });
+      return textResult({ fuente: source, query, total_encontrados: clients.length, resultados: clients.slice(0, limit) });
     }
   );
 
@@ -245,8 +201,8 @@ app.use(express.json());
 
 app.get('/health', async (req, res) => {
   try {
-    const rows = await getData();
-    res.json({ status: 'ok', clientes_en_cache: rows.length, timestamp: new Date() });
+    const total = await getCompanyTotal('sales');
+    res.json({ status: 'ok', total, timestamp: new Date() });
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
   }
