@@ -62,12 +62,19 @@ function salesAmountEurExpr(a) {
 }
 
 // "Invoicing" = vBI_INVOICING_DATA: lo que se ha FACTURADO realmente.
-// Usa AmountEUR (ya convertido por la propia vista) y excluye lineas anuladas.
-// NOTA: a diferencia de Sales, esta parte no viene de una query oficial de
-// Nico (no la tengo) - es la lectura mas razonable de la vista vBI de BI.
-// Si el numero no encaja con el reporting oficial, hay que revisarlo con Nico.
+// Misma logica de FX fijo que Sales, pero sobre Amount y con fallback a
+// Amount sin convertir para fechas fuera de rango (asi es la query oficial
+// de Nico, a diferencia de Sales que en ese caso devuelve NULL).
+// No filtra Anulada ni excluye DocNum - tal cual la vista oficial de Nico.
 function invoicingAmountEurExpr(a) {
-  return `${a}.AmountEUR`;
+  return `CASE
+    WHEN ${a}.DocDate >= '2026-01-01' AND ${a}.Sucursal = 'US' THEN ${a}.Amount / 1.20
+    WHEN ${a}.DocDate >= '2026-01-01' AND ${a}.Sucursal = 'CA' THEN ${a}.Amount / 1.60
+    WHEN ${a}.DocDate >= '2025-01-01' AND ${a}.DocDate < '2026-01-01' AND ${a}.Sucursal = 'US' THEN ${a}.Amount / 1.18
+    WHEN ${a}.DocDate >= '2025-01-01' AND ${a}.DocDate < '2026-01-01' AND ${a}.Sucursal = 'CA' THEN ${a}.Amount / 1.56
+    WHEN ${a}.Sucursal = 'BCN' THEN ${a}.Amount / 1
+    ELSE ${a}.Amount
+  END`;
 }
 
 const SOURCES = {
@@ -91,7 +98,13 @@ const SOURCES = {
     alias: 'i',
     amountExpr: invoicingAmountEurExpr('i'),
     cols: { market: 'i.Country', rep: 'i.DocSlpName', brand: 'i.Marca', channel: 'i.OrderType' },
-    extraWhere: () => [`(i.Anulada IS NULL OR i.Anulada <> 'X')`]
+    extraWhere: (req) => {
+      const typeParams = SALES_TYPE_FILTER.map((t, idx) => { req.input(`ity${idx}`, sql.NVarChar, t); return `@ity${idx}`; });
+      return [
+        `i.Type IN (${typeParams.join(',')})`,
+        `i.DocDate >= '2023-01-01'`
+      ];
+    }
   }
 };
 
