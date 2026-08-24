@@ -121,7 +121,10 @@ const SOURCES = {
 function dimExprFor(a, dimension) {
   switch (dimension) {
     case 'market': return `ISNULL(UPPER(g.[Group]), 'Sin asignar')`;
-    case 'rep': return `ISNULL(${a}.DocSlpName, 'Sin asignar')`;
+    // El representante es el asignado al CLIENTE (Customer.SlpName), no el de
+    // la linea de venta (DocSlpName puede diferir si el pedido lo registro
+    // otra persona) - validado contra el informe: SlpName cuadra al centimo.
+    case 'rep': return `ISNULL(c.SlpName, 'Sin asignar')`;
     case 'channel': return `ISNULL(${a}.OrderType, 'Sin asignar')`;
     case 'brand': return `ISNULL(${a}.Marca, 'Sin asignar')`;
     default: throw new Error(`Dimension desconocida: ${dimension}`);
@@ -156,7 +159,7 @@ function buildFromAndWhere(req, src, filters, ranges) {
   req.input('prevEnd', sql.Date, ranges.prevEnd);
 
   if (filters.market) { parts.push(`UPPER(g.[Group]) LIKE @market`); req.input('market', sql.NVarChar, `%${filters.market.toUpperCase()}%`); }
-  if (filters.rep) { parts.push(`${a}.DocSlpName LIKE @rep`); req.input('rep', sql.NVarChar, `%${filters.rep}%`); }
+  if (filters.rep) { parts.push(`c.SlpName LIKE @rep`); req.input('rep', sql.NVarChar, `%${filters.rep}%`); }
   if (filters.channel) { parts.push(`${a}.OrderType LIKE @channel`); req.input('channel', sql.NVarChar, `%${filters.channel}%`); }
   if (filters.brand) { parts.push(`${a}.Marca = @brand`); req.input('brand', sql.NVarChar, filters.brand); }
   if (filters.nameQuery) { parts.push(`${a}.CardName LIKE @nameQuery`); req.input('nameQuery', sql.NVarChar, `%${filters.nameQuery}%`); }
@@ -238,7 +241,7 @@ export async function aggregateClients(source, filters = {}) {
       ${a}.CardCode AS cardCode,
       MAX(${a}.CardName) AS cardName,
       ISNULL(MAX(UPPER(g.[Group])), 'Sin asignar') AS market,
-      ISNULL(MAX(${a}.DocSlpName), 'Sin asignar') AS rep,
+      ISNULL(MAX(c.SlpName), 'Sin asignar') AS rep,
       ISNULL(MAX(${a}.OrderType), 'Sin asignar') AS channel,
       SUM(CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_cur,
       SUM(CASE WHEN ${a}.DocDate BETWEEN @prevStart AND @prevEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_prev
