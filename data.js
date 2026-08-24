@@ -78,19 +78,27 @@ function invoicingAmountEurExpr(a) {
   END`;
 }
 
+// Exclusion exacta del Power Query de Sales: ajustes ZG3 de tiendas
+// flagship concretas (importes negativos de correccion, no venta real).
+const SALES_EXCLUDED_FLAGSHIP_ZG3 = ['FLAG0001', 'FLAG0002', '0200000030'];
+
 const SOURCES = {
   sales: {
     table: '[dbo].[vBI_SALES_DATA]',
     alias: 's',
     amountExpr: salesAmountEurExpr('s'),
+    // La query oficial hace JOIN (no LEFT JOIN) con vBI_ITEM_DATA por idItem.
+    extraJoin: (a) => `JOIN [dbo].[vBI_ITEM_DATA] it ON it.idItem = ${a}.idItem`,
     extraWhere: (req) => {
       const typeParams = TYPE_FILTER.map((t, idx) => { req.input(`ty${idx}`, sql.NVarChar, t); return `@ty${idx}`; });
       const excParams = SALES_EXCLUDED_DOCNUMS.map((d, idx) => { req.input(`ex${idx}`, sql.NVarChar, d); return `@ex${idx}`; });
+      const flagParams = SALES_EXCLUDED_FLAGSHIP_ZG3.map((c, idx) => { req.input(`flag${idx}`, sql.NVarChar, c); return `@flag${idx}`; });
       return [
         `s.Type IN (${typeParams.join(',')})`,
         `s.DocNum NOT IN (${excParams.join(',')})`,
         `s.DocDate >= '2023-01-01'`,
-        `s.SeriesName <> 'DZCO'`
+        `s.SeriesName <> 'DZCO'`,
+        `NOT (s.CardCode IN (${flagParams.join(',')}) AND s.SeriesName = 'ZG3')`
       ];
     }
   },
@@ -134,12 +142,12 @@ function buildFromAndWhere(req, src, filters, ranges) {
   const a = src.alias;
   const from = `
     FROM ${src.table} ${a}
-    JOIN [dbo].[vBI_CUSTOMER_DATA] c ON c.idCustomer = ${a}.idCustomer
+    JOIN [dbo].[vBI_CUSTOMER_DATA] c ON c.idCustomer = ${a}.idCustomer AND c.ChannelName <> 'EB GROUP' AND c.Sucursal <> 'HK'
     LEFT JOIN [dbo].[vBI_GROUPINGS] g ON g.[Option] = c.AreaName AND g.[Type] = 'areaname'
+    ${src.extraJoin ? src.extraJoin(a) : ''}
   `;
   const parts = [
     `${a}.DocDate BETWEEN @prevStart AND @curEnd`,
-    `(CASE WHEN c.idCustomer = 'USEB SpainEB' THEN 'OPTICS' ELSE ISNULL(c.ChannelName,'') END) <> 'EB GROUP'`,
     ...src.extraWhere(req)
   ];
   req.input('curStart', sql.Date, ranges.curStart);
