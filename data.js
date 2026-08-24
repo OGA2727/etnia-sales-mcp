@@ -40,11 +40,15 @@ export function dateRanges() {
   };
 }
 
-// ── Definiciones oficiales de negocio (segun vista SQL de Nico) ─────────────
-// "Sales" = vBI_SALES_DATA: lo que se ha VENDIDO (pedido), con conversion a EUR
-// a tipo de cambio fijo de reporting (no el spot). Filtra Type y excluye unos
-// DocNum concretos marcados como erroneos/duplicados en el origen.
-const SALES_TYPE_FILTER = ['Frames', 'Others Flagship'];
+// ── Definiciones oficiales de negocio (validadas contra el informe de Nico) ─
+// Base: vBI_SALES_DATA ("Sales" = vendido/pedido) y vBI_INVOICING_DATA
+// ("Invoicing" = facturado real), cruzadas SIEMPRE con vBI_CUSTOMER_DATA por
+// idCustomer (INNER JOIN: un cliente sin ficha es una cuenta intercompania /
+// placeholder, p.ej. "Etnia Barcelona LLC" - no cuenta como venta real).
+// El "Market" (pais agrupado, p.ej. CEE/MEA/APAC/LATAM) sale de mapear
+// Customer.AreaName -> vBI_GROUPINGS.Option (Type='areaname') -> Group.
+const TYPE_FILTER = ['Frames', 'Others Flagship'];
+// Exclusiones exactas de la query oficial de Sales (DocNum erroneos/duplicados).
 const SALES_EXCLUDED_DOCNUMS = [
   '0185001486', '121124672', '0060003093', '0075099698',
   '0075099696', '0075101049', '0185001487', '0060012201'
@@ -61,11 +65,8 @@ function salesAmountEurExpr(a) {
   END`;
 }
 
-// "Invoicing" = vBI_INVOICING_DATA: lo que se ha FACTURADO realmente.
-// Misma logica de FX fijo que Sales, pero sobre Amount y con fallback a
-// Amount sin convertir para fechas fuera de rango (asi es la query oficial
-// de Nico, a diferencia de Sales que en ese caso devuelve NULL).
-// No filtra Anulada ni excluye DocNum - tal cual la vista oficial de Nico.
+// Invoicing usa la misma logica de FX pero con fallback a Amount sin
+// convertir (asi es la query oficial de Nico, a diferencia de Sales).
 function invoicingAmountEurExpr(a) {
   return `CASE
     WHEN ${a}.DocDate >= '2026-01-01' AND ${a}.Sucursal = 'US' THEN ${a}.Amount / 1.20
@@ -82,14 +83,14 @@ const SOURCES = {
     table: '[dbo].[vBI_SALES_DATA]',
     alias: 's',
     amountExpr: salesAmountEurExpr('s'),
-    cols: { market: 's.CountryName', rep: 's.DocSlpName', brand: 's.Marca', channel: 's.OrderType' },
     extraWhere: (req) => {
-      const typeParams = SALES_TYPE_FILTER.map((t, idx) => { req.input(`ty${idx}`, sql.NVarChar, t); return `@ty${idx}`; });
+      const typeParams = TYPE_FILTER.map((t, idx) => { req.input(`ty${idx}`, sql.NVarChar, t); return `@ty${idx}`; });
       const excParams = SALES_EXCLUDED_DOCNUMS.map((d, idx) => { req.input(`ex${idx}`, sql.NVarChar, d); return `@ex${idx}`; });
       return [
         `s.Type IN (${typeParams.join(',')})`,
         `s.DocNum NOT IN (${excParams.join(',')})`,
-        `s.DocDate >= '2023-01-01'`
+        `s.DocDate >= '2023-01-01'`,
+        `s.SeriesName <> 'DZCO'`
       ];
     }
   },
@@ -97,9 +98,8 @@ const SOURCES = {
     table: '[dbo].[vBI_INVOICING_DATA]',
     alias: 'i',
     amountExpr: invoicingAmountEurExpr('i'),
-    cols: { market: 'i.Country', rep: 'i.DocSlpName', brand: 'i.Marca', channel: 'i.OrderType' },
     extraWhere: (req) => {
-      const typeParams = SALES_TYPE_FILTER.map((t, idx) => { req.input(`ity${idx}`, sql.NVarChar, t); return `@ity${idx}`; });
+      const typeParams = TYPE_FILTER.map((t, idx) => { req.input(`ity${idx}`, sql.NVarChar, t); return `@ity${idx}`; });
       return [
         `i.Type IN (${typeParams.join(',')})`,
         `i.DocDate >= '2023-01-01'`
@@ -108,16 +108,38 @@ const SOURCES = {
   }
 };
 
+// Dimensiones: "market" sale de Customer.AreaName -> vBI_GROUPINGS, el resto
+// vive directamente en la fila de Sales/Invoicing.
+function dimExprFor(a, dimension) {
+  switch (dimension) {
+    case 'market': return `ISNULL(UPPER(g.[Group]), 'Sin asignar')`;
+    case 'rep': return `ISNULL(${a}.DocSlpName, 'Sin asignar')`;
+    case 'channel': return `ISNULL(${a}.OrderType, 'Sin asignar')`;
+    case 'brand': return `ISNULL(${a}.Marca, 'Sin asignar')`;
+    default: throw new Error(`Dimension desconocida: ${dimension}`);
+  }
+}
+
 function getSource(source) {
   const s = SOURCES[source];
   if (!s) throw new Error(`source desconocido: ${source} (usa 'sales' o 'invoicing')`);
   return s;
 }
 
-function buildCommonWhere(req, src, filters, ranges) {
+// Cliente debe existir en Customer (INNER JOIN por idCustomer) - excluye
+// cuentas intercompania/placeholder que no representan venta real a terceros.
+// Se excluye tambien el canal EB GROUP (grupo interno), salvo la cuenta
+// idCustomer='USEB SpainEB' que Power Query reclasifica a OPTICS.
+function buildFromAndWhere(req, src, filters, ranges) {
   const a = src.alias;
+  const from = `
+    FROM ${src.table} ${a}
+    JOIN [dbo].[vBI_CUSTOMER_DATA] c ON c.idCustomer = ${a}.idCustomer
+    LEFT JOIN [dbo].[vBI_GROUPINGS] g ON g.[Option] = c.AreaName AND g.[Type] = 'areaname'
+  `;
   const parts = [
     `${a}.DocDate BETWEEN @prevStart AND @curEnd`,
+    `(CASE WHEN c.idCustomer = 'USEB SpainEB' THEN 'OPTICS' ELSE ISNULL(c.ChannelName,'') END) <> 'EB GROUP'`,
     ...src.extraWhere(req)
   ];
   req.input('curStart', sql.Date, ranges.curStart);
@@ -125,12 +147,12 @@ function buildCommonWhere(req, src, filters, ranges) {
   req.input('prevStart', sql.Date, ranges.prevStart);
   req.input('prevEnd', sql.Date, ranges.prevEnd);
 
-  if (filters.market) { parts.push(`${src.cols.market} LIKE @market`); req.input('market', sql.NVarChar, `%${filters.market}%`); }
-  if (filters.rep) { parts.push(`${src.cols.rep} LIKE @rep`); req.input('rep', sql.NVarChar, `%${filters.rep}%`); }
-  if (filters.channel) { parts.push(`${src.cols.channel} LIKE @channel`); req.input('channel', sql.NVarChar, `%${filters.channel}%`); }
-  if (filters.brand) { parts.push(`${src.cols.brand} = @brand`); req.input('brand', sql.NVarChar, filters.brand); }
+  if (filters.market) { parts.push(`UPPER(g.[Group]) LIKE @market`); req.input('market', sql.NVarChar, `%${filters.market.toUpperCase()}%`); }
+  if (filters.rep) { parts.push(`${a}.DocSlpName LIKE @rep`); req.input('rep', sql.NVarChar, `%${filters.rep}%`); }
+  if (filters.channel) { parts.push(`${a}.OrderType LIKE @channel`); req.input('channel', sql.NVarChar, `%${filters.channel}%`); }
+  if (filters.brand) { parts.push(`${a}.Marca = @brand`); req.input('brand', sql.NVarChar, filters.brand); }
   if (filters.nameQuery) { parts.push(`${a}.CardName LIKE @nameQuery`); req.input('nameQuery', sql.NVarChar, `%${filters.nameQuery}%`); }
-  return parts.join(' AND ');
+  return { from, where: parts.join(' AND ') };
 }
 
 function withVariation(r) {
@@ -149,15 +171,13 @@ function withVariation(r) {
 
 export async function aggregateBy(source, dimension, filters = {}) {
   const src = getSource(source);
-  const dimCol = src.cols[dimension];
-  if (!dimCol) throw new Error(`Dimension desconocida: ${dimension}`);
-  const dimExpr = `ISNULL(${dimCol}, 'Sin asignar')`;
   const a = src.alias;
+  const dimExpr = dimExprFor(a, dimension);
 
   const pool = await getPool();
   const req = pool.request();
   const ranges = dateRanges();
-  const where = buildCommonWhere(req, src, filters, ranges);
+  const { from, where } = buildFromAndWhere(req, src, filters, ranges);
 
   const query = `
     SELECT
@@ -165,7 +185,7 @@ export async function aggregateBy(source, dimension, filters = {}) {
       SUM(CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_cur,
       SUM(CASE WHEN ${a}.DocDate BETWEEN @prevStart AND @prevEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_prev,
       COUNT(DISTINCT CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${a}.CardCode END) AS clientes_activos
-    FROM ${src.table} ${a}
+    ${from}
     WHERE ${where}
     GROUP BY ${dimExpr}
   `;
@@ -183,13 +203,13 @@ export async function getCompanyTotal(source, filters = {}) {
   const pool = await getPool();
   const req = pool.request();
   const ranges = dateRanges();
-  const where = buildCommonWhere(req, src, filters, ranges);
+  const { from, where } = buildFromAndWhere(req, src, filters, ranges);
   const query = `
     SELECT
       SUM(CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_cur,
       SUM(CASE WHEN ${a}.DocDate BETWEEN @prevStart AND @prevEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_prev,
       COUNT(DISTINCT CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${a}.CardCode END) AS clientes_activos
-    FROM ${src.table} ${a}
+    ${from}
     WHERE ${where}
   `;
   const result = await req.query(query);
@@ -204,17 +224,17 @@ export async function aggregateClients(source, filters = {}) {
   const pool = await getPool();
   const req = pool.request();
   const ranges = dateRanges();
-  const where = buildCommonWhere(req, src, filters, ranges);
+  const { from, where } = buildFromAndWhere(req, src, filters, ranges);
   const query = `
     SELECT
       ${a}.CardCode AS cardCode,
       MAX(${a}.CardName) AS cardName,
-      ISNULL(MAX(${src.cols.market}), 'Sin asignar') AS market,
-      ISNULL(MAX(${src.cols.rep}), 'Sin asignar') AS rep,
-      ISNULL(MAX(${src.cols.channel}), 'Sin asignar') AS channel,
+      ISNULL(MAX(UPPER(g.[Group])), 'Sin asignar') AS market,
+      ISNULL(MAX(${a}.DocSlpName), 'Sin asignar') AS rep,
+      ISNULL(MAX(${a}.OrderType), 'Sin asignar') AS channel,
       SUM(CASE WHEN ${a}.DocDate BETWEEN @curStart AND @curEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_cur,
       SUM(CASE WHEN ${a}.DocDate BETWEEN @prevStart AND @prevEnd THEN ${src.amountExpr} ELSE 0 END) AS ytd_prev
-    FROM ${src.table} ${a}
+    ${from}
     WHERE ${where}
     GROUP BY ${a}.CardCode
   `;
